@@ -16,14 +16,11 @@ import structlog
 class Hyperparameters:
     block_size: int = 128
     batch_size: int = 64
-    # CHANGED: Reduced vocab size for a more dense and effective vocabulary on this specific dataset.
     vocab_size: int = 8_000 
     n_layer: int = 6
     n_head: int = 8
     d_model: int = 512
-    # CHANGED: Increased dropout for better regularization on the small dataset.
     dropout: float = 0.2
-    # CHANGED: Switched to AdamW's standard learning rate and added weight decay.
     lr: float = 3e-4 
     weight_decay: float = 0.1
     evals_per_epoch: int = 3
@@ -33,7 +30,6 @@ class Hyperparameters:
     num_titles: int = 100_000
     val_frac: float = 0.10
     log_file: str = "./logs/mainrun.log"
-    # CHANGED: Added warmup steps for the learning rate scheduler.
     warmup_steps: int = 100 
 
 def configure_logging(log_file: str):
@@ -201,7 +197,6 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         self.head.weight = self.token_emb.weight
 
-    # CHANGED: Switched to a more modern initialization scheme for residual projections.
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -210,7 +205,6 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        # Apply special scaled init for the residual projections
         for name, p in self.named_parameters():
             if name.endswith('proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.cfg.n_layer))
@@ -229,12 +223,9 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
         return logits, loss
 
-# CHANGED: Added a learning rate scheduler function with warmup
 def get_lr(it, warmup_steps, lr, max_steps):
-    # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
         return lr * it / warmup_steps
-    # 2) constant lr after warmup
     return lr
 
 def main():
@@ -282,9 +273,7 @@ def main():
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
     
-    # CHANGED: Switched to AdamW optimizer.
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    # Note: The original CosineAnnealingLR scheduler is removed in favor of a manual warmup+decay inside the loop.
 
     def evaluate():
         model.eval()
@@ -305,11 +294,8 @@ def main():
         for _ in tqdm(range(1, batches + 1), desc=f"Epoch {epoch}/{args.epochs}"):
             step += 1
             
-            # CHANGED: Implemented manual LR scheduling with warmup and cosine decay.
-            # Determine the learning rate for this step.
             lr_decay_steps = max_steps - args.warmup_steps
             lr_step = get_lr(step, args.warmup_steps, args.lr, max_steps)
-            # Cosine decay part
             if step > args.warmup_steps:
                 decay_ratio = (step - args.warmup_steps) / lr_decay_steps
                 coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
@@ -317,14 +303,12 @@ def main():
             for param_group in opt.param_groups:
                 param_group['lr'] = lr_step
 
-
             xb, yb, ptr = get_batch(train_ids, ptr, args.block_size, args.batch_size, device)
             _, loss = model(xb, yb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            # The original scheduler.step() is no longer needed.
 
             elapsed = time.time() - t0
             logger.log("training_step",
@@ -342,6 +326,22 @@ def main():
                           max_steps=max_steps,
                           loss=val_loss,
                           elapsed_time=elapsed)
+
+    # === CODE ADDED HERE ===
+    logger.log("training_finished", final_val_loss=val_loss)
+    
+    # Create a directory to save the artifacts
+    save_dir = Path("./model_artifacts")
+    save_dir.mkdir(exist_ok=True)
+    
+    # Save the model weights
+    torch.save(model.state_dict(), save_dir / "model_weights.pth")
+    
+    # Save the tokenizer
+    tok.tk.save(str(save_dir / "tokenizer.json"))
+    
+    logger.log("artifacts_saved", path=str(save_dir))
+
 
 if __name__ == "__main__":
     try:
