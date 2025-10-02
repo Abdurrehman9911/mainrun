@@ -16,13 +16,16 @@ import structlog
 class Hyperparameters:
     block_size: int = 128
     batch_size: int = 64
-    vocab_size: int = 16_000
+    # CHANGED: Reduced vocab size for a more dense and effective vocabulary on this specific dataset.
+    vocab_size: int = 8_000 
     n_layer: int = 6
     n_head: int = 8
     d_model: int = 512
-    dropout: float = 0.1
-    lr: float = 6e-3
-    weight_decay: float = 0.0
+    # CHANGED: Increased dropout for better regularization on the small dataset.
+    dropout: float = 0.2
+    # CHANGED: Switched to AdamW's standard learning rate and added weight decay.
+    lr: float = 3e-4 
+    weight_decay: float = 0.1
     evals_per_epoch: int = 3
     
     epochs: int = 7
@@ -30,6 +33,8 @@ class Hyperparameters:
     num_titles: int = 100_000
     val_frac: float = 0.10
     log_file: str = "./logs/mainrun.log"
+    # CHANGED: Added warmup steps for the learning rate scheduler.
+    warmup_steps: int = 100 
 
 def configure_logging(log_file: str):
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
@@ -196,12 +201,19 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         self.head.weight = self.token_emb.weight
 
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+    # CHANGED: Switched to a more modern initialization scheme for residual projections.
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
+            if module.bias is not None:
                 nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+        # Apply special scaled init for the residual projections
+        for name, p in self.named_parameters():
+            if name.endswith('proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.cfg.n_layer))
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         B, T = idx.size()
@@ -216,6 +228,14 @@ class GPT(nn.Module):
         else:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
         return logits, loss
+
+# CHANGED: Added a learning rate scheduler function with warmup
+def get_lr(it, warmup_steps, lr, max_steps):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return lr * it / warmup_steps
+    # 2) constant lr after warmup
+    return lr
 
 def main():
     args = Hyperparameters()
@@ -262,8 +282,9 @@ def main():
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
     
-    opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
+    # CHANGED: Switched to AdamW optimizer.
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    # Note: The original CosineAnnealingLR scheduler is removed in favor of a manual warmup+decay inside the loop.
 
     def evaluate():
         model.eval()
@@ -283,19 +304,34 @@ def main():
     for epoch in range(1, args.epochs + 1):
         for _ in tqdm(range(1, batches + 1), desc=f"Epoch {epoch}/{args.epochs}"):
             step += 1
+            
+            # CHANGED: Implemented manual LR scheduling with warmup and cosine decay.
+            # Determine the learning rate for this step.
+            lr_decay_steps = max_steps - args.warmup_steps
+            lr_step = get_lr(step, args.warmup_steps, args.lr, max_steps)
+            # Cosine decay part
+            if step > args.warmup_steps:
+                decay_ratio = (step - args.warmup_steps) / lr_decay_steps
+                coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+                lr_step = lr_step * coeff
+            for param_group in opt.param_groups:
+                param_group['lr'] = lr_step
+
+
             xb, yb, ptr = get_batch(train_ids, ptr, args.block_size, args.batch_size, device)
             _, loss = model(xb, yb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            scheduler.step()
+            # The original scheduler.step() is no longer needed.
 
             elapsed = time.time() - t0
             logger.log("training_step",
                       step=step,
                       max_steps=max_steps,
                       loss=loss.item(),
+                      lr=lr_step,
                       elapsed_time=elapsed,
                       prnt=False)
 
